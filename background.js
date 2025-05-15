@@ -96,16 +96,17 @@ async function blobToDataURL(blob) {
 
 // Основной процесс загрузки полного изображения
 async function startDownloadProcess(imageInfo) {
-  const { identifier, baseImageUrlPattern, currentScale, originalUrl } = imageInfo;
+  const { identifier, baseImageUrlPattern, currentScale, originalUrl, isDeepZoom, infoJsonUrl } = imageInfo;
+  console.log('Запрос JSON по URL:', infoJsonUrl);
   const basePattern = baseImageUrlPattern.replace('{IDENTIFIER}', identifier);
 
   try {
     console.log('Определяем максимальный масштаб...');
-    const maxScale = await determineMaxScale(basePattern, currentScale);
+    const maxScale = await determineMaxScale(basePattern, currentScale, isDeepZoom, infoJsonUrl);
     console.log(`Максимальный масштаб: ${maxScale}`);
 
     console.log('Определяем размеры плиток...');
-    const { numRows, numCols, tileWidth, tileHeight } = await determineDimensions(basePattern, maxScale);
+    const { numRows, numCols, tileWidth, tileHeight } = await determineDimensions(basePattern, maxScale, isDeepZoom, infoJsonUrl);
     console.log(`Плиток: ${numRows}x${numCols}, размер тайла: ${tileWidth}x${tileHeight}`);
 
     if (!numRows || !numCols || !tileWidth || !tileHeight) {
@@ -113,7 +114,7 @@ async function startDownloadProcess(imageInfo) {
     }
 
     console.log('Загружаем все плитки...');
-    const tiles = await fetchAllTiles(basePattern, maxScale, numRows, numCols);
+    const tiles = await fetchAllTiles(basePattern, maxScale, numRows, numCols, isDeepZoom);
     const count = tiles.filter(Boolean).length;
     console.log(`Успешно загружено ${count} из ${numRows * numCols} тайлов.`);
     if (!count) throw new Error('Не загружено ни одной плитки.');
@@ -157,35 +158,71 @@ async function checkUrlExists(url) {
 }
 
 // Определяет максимальный уровень масштабирования
-async function determineMaxScale(basePattern, initialScale) {
-  let scale = initialScale;
-  for (let i = 0; i < 20; i++) {
-    const test = basePattern.replace('{SCALE}', scale + 1).replace('{ROW}', 0).replace('{COL}', 0);
-    if (await checkUrlExists(test)) scale++;
-    else break;
+async function determineMaxScale(basePattern, initialScale, isDeepZoom, infoJsonUrl) {
+  if (isDeepZoom && infoJsonUrl) {
+    try {
+      const response = await fetch(infoJsonUrl);
+      const json = await response.json();
+      const scaleFactors = json.tiles[0].scaleFactors;
+      return Math.max(...scaleFactors);
+    } catch (e) {
+      console.error('Ошибка при получении JSON:', e);
+      throw e;
+    }
+  } else {
+    let scale = initialScale;
+    for (let i = 0; i < 20; i++) {
+      const test = basePattern.replace('{SCALE}', scale + 1).replace('{ROW}', 0).replace('{COL}', 0);
+      if (await checkUrlExists(test)) scale++;
+      else break;
+    }
+    return scale;
   }
-  return scale;
 }
 
 // Определяет количество строк/столбцов и размер плитки
-async function determineDimensions(basePattern, scale) {
-  let numRows = 0, numCols = 0, tileWidth = 0, tileHeight = 0;
-  for (let r = 0; r < 2000; r++) {
-    const url = basePattern.replace('{SCALE}', scale).replace('{ROW}', r).replace('{COL}', 0);
-    if (!(await checkUrlExists(url))) break;
-    numRows++;
-    if (!tileWidth) {
-      const img = await fetchImage(url);
-      tileWidth = img?.width || 0;
-      tileHeight = img?.height || 0;
+async function determineDimensions(basePattern, scale, isDeepZoom, infoJsonUrl) {
+  if (isDeepZoom && infoJsonUrl) {
+    try {
+      const response = await fetch(infoJsonUrl);
+      const json = await response.json();
+      const tileWidth = json.tiles[0].width;
+      const tileHeight = json.tiles[0].height;
+      const scaleFactors = json.tiles[0].scaleFactors;
+      const scaleFactor = scaleFactors.find(sf => sf === scale);
+      if (!scaleFactor) throw new Error(`Scale factor ${scale} not found in JSON`);
+
+      const widthAtScale = json.width;
+	  //Math.ceil(json.width / scaleFactor);
+      const heightAtScale = json.height;
+	  //Math.ceil(json.height / scaleFactor);
+      const numCols = Math.ceil(widthAtScale / tileWidth);
+      const numRows = Math.ceil(heightAtScale / tileHeight);
+
+      return { numRows, numCols, tileWidth, tileHeight };
+    } catch (e) {
+      console.error('Ошибка при получении JSON:', e);
+      throw e;
     }
+  } else {
+    let numRows = 0, numCols = 0, tileWidth = 0, tileHeight = 0;
+    for (let r = 0; r < 2000; r++) {
+      const url = basePattern.replace('{SCALE}', scale).replace('{ROW}', r).replace('{COL}', 0);
+      if (!(await checkUrlExists(url))) break;
+      numRows++;
+      if (!tileWidth) {
+        const img = await fetchImage(url);
+        tileWidth = img?.width || 0;
+        tileHeight = img?.height || 0;
+      }
+    }
+    for (let c = 0; c < 2000 && numRows && tileWidth; c++) {
+      const url = basePattern.replace('{SCALE}', scale).replace('{ROW}', 0).replace('{COL}', c);
+      if (!(await checkUrlExists(url))) break;
+      numCols++;
+    }
+    return { numRows, numCols, tileWidth, tileHeight };
   }
-  for (let c = 0; c < 2000 && numRows && tileWidth; c++) {
-    const url = basePattern.replace('{SCALE}', scale).replace('{ROW}', 0).replace('{COL}', c);
-    if (!(await checkUrlExists(url))) break;
-    numCols++;
-  }
-  return { numRows, numCols, tileWidth, tileHeight };
 }
 
 // Загружает и декодирует изображение в ImageBitmap
@@ -202,41 +239,82 @@ async function fetchImage(url) {
 }
 
 // Загружает все плитки параллельно
-async function fetchAllTiles(basePattern, scale, numRows, numCols) {
+async function fetchAllTiles(basePattern, scale, numRows, numCols, isDeepZoom) {
   const tiles = [];
-  const jobs = [];
-  for (let r = 0; r < numRows; r++) {
-    for (let c = 0; c < numCols; c++) {
-      const url = basePattern.replace('{SCALE}', scale).replace('{ROW}', r).replace('{COL}', c);
-      jobs.push(fetchImage(url).then(img => tiles[r * numCols + c] = img));
+  for (let row = 0; row < numRows; row++) {
+    for (let col = 0; col < numCols; col++) {
+      let url;
+      if (isDeepZoom) {
+        url = basePattern.replace('{SCALE}', scale).replace('{COL}', col).replace('{ROW}', row);
+      } else {
+        url = basePattern.replace('{SCALE}', scale).replace('{ROW}', row).replace('{COL}', col);
+      }
+      tiles.push(fetchImage(url));
     }
   }
-  await Promise.all(jobs);
-  return tiles;
+  return Promise.all(tiles.map(p => p.catch(() => null)));
 }
 
 // Анализирует URL для извлечения паттерна и метаданных изображения
 function analyzeUrl(url) {
   try {
     const u = new URL(url);
-    const parts = u.pathname.split('/');
-    const regex = /(\d+)\/(\d+)_(\d+)\.jpg$/;
+    let pathToAnalyze, baseUrl, isDeepZoom = false, infoJsonUrl = null;
+
+    if (u.searchParams.has('DeepZoom')) {
+      isDeepZoom = true;
+	  const deepZoomPath = u.searchParams.get('DeepZoom');
+	  console.log('Определен deepZoomPath:', deepZoomPath);
+      const tiffIndex = deepZoomPath.indexOf('.tiff');
+	  console.log('Определен tiffIndex:', tiffIndex);
+      const basePath = deepZoomPath.substring(0, tiffIndex + 5);
+	  console.log('Определен basePath:', basePath);	  
+      const jsonPath = basePath + '/info.json';
+	  console.log('Определен jsonPath:', jsonPath);		  
+	  infoJsonUrl = u.origin + u.pathname + '?IIIF=' + jsonPath;
+	  console.log('Определен infoJsonUrl:', infoJsonUrl);		  
+      pathToAnalyze = deepZoomPath;
+      baseUrl = u.origin + u.pathname + '?DeepZoom=';
+    } else {
+      pathToAnalyze = u.pathname;
+      baseUrl = u.origin;
+    }
+
+    const parts = pathToAnalyze.split('/').filter(Boolean);
+    const regex = /^(\d+)_(\d+)\.jpg$/;
+
     for (let i = parts.length - 1; i >= 1; i--) {
-      const seg = `${parts[i-1]}/${parts[i]}`;
-      const m = seg.match(regex);
-      if (!m) continue;
-      const [ , scale, row, col ] = m.map(Number);
-      const base = parts.slice(0, i-1);
-      let id, pattern;
-      if (url.includes('dzc_output_files')) {
-        const idx = base.lastIndexOf('dzc_output_files');
-        id = base[idx-1];
-        pattern = `${u.origin}${base.slice(0, idx-1).join('/')}/${id}/dzc_output_files/{SCALE}/{ROW}_{COL}.jpg`;
-      } else {
-        id = base[base.length-1];
-        pattern = `${u.origin}${base.slice(0, base.length-1).join('/')}/${id}/{SCALE}/{ROW}_{COL}.jpg`;
+      if (/^\d+$/.test(parts[i - 1]) && regex.test(parts[i])) {
+        const scale = Number(parts[i - 1]);
+        const m = parts[i].match(regex);
+        let row = isDeepZoom ? Number(m[2]) : Number(m[1]);
+        let col = isDeepZoom ? Number(m[1]) : Number(m[2]);
+
+        let identifier, pathUpToIdentifier;
+        const dzcIndex = parts.indexOf('dzc_output_files');
+        if (!isDeepZoom && dzcIndex !== -1 && dzcIndex < i - 1) {
+          identifier = parts[dzcIndex - 1];
+          pathUpToIdentifier = parts.slice(0, dzcIndex - 1).join('/');
+        } else {
+          identifier = parts[i - 2];
+          pathUpToIdentifier = parts.slice(0, i - 2).join('/');
+        }
+
+        const hasDzc = !isDeepZoom && dzcIndex !== -1 && dzcIndex < i - 1;
+        const tileFormat = isDeepZoom ? '{SCALE}/{COL}_{ROW}.jpg' : '{SCALE}/{ROW}_{COL}.jpg';
+        const pattern = `${baseUrl}${pathUpToIdentifier ? '/' + pathUpToIdentifier : ''}/{IDENTIFIER}${hasDzc ? '/dzc_output_files' : ''}/${tileFormat}`;
+
+        return {
+          originalUrl: url,
+          identifier: identifier,
+          currentScale: scale,
+          currentRow: row,
+          currentCol: col,
+          baseImageUrlPattern: pattern,
+          isDeepZoom: isDeepZoom,
+          infoJsonUrl: infoJsonUrl
+        };
       }
-      return { originalUrl: url, identifier: id, currentScale: scale, currentRow: row, currentCol: col, baseImageUrlPattern: pattern.replace(id, '{IDENTIFIER}') };
     }
   } catch (e) {
     console.error('Ошибка анализа URL:', url, e);
